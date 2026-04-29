@@ -47,6 +47,9 @@ export async function POST(req: Request) {
     try {
       // 2. 获取最终需要发给阿里云的 URL
       // 如果 imagePath 是以 http 开头的，说明它是二次编辑传过来的线上地址，直接用，不需要再上传到 OSS
+      // 注意：在 Vercel 这种 Serverless 环境中，viapiUtils 可能会因为依赖缺失或网络超时导致失败
+      // 为了稳定，我们直接使用阿里云 SDK 的 OSS 直传或者修复 viapiUtils 的超时问题
+      // 但最快的方式是给 viapiUtils.upload 增加重试机制，或者忽略其内部的超时警告
       const imageUrl = imagePath.startsWith('http') 
         ? imagePath 
         : await viapiUtils.upload(accessKeyId, accessKeySecret, imagePath);
@@ -54,6 +57,19 @@ export async function POST(req: Request) {
       const maskUrl = maskPath.startsWith('http')
         ? maskPath
         : await viapiUtils.upload(accessKeyId, accessKeySecret, maskPath);
+
+      // 由于 viapiUtils.upload 内部实现有些老旧，在 Vercel 线上环境可能会返回缺少 http/https 协议头的 URL
+      // 例如： undefined://viapi-customer-temp.oss-cn-shanghai... 
+      // 我们在这里强制修复这个 URL 协议头
+      const fixUrlProtocol = (url: string) => {
+        if (url.startsWith('undefined://')) {
+          return url.replace('undefined://', 'http://');
+        }
+        return url;
+      };
+
+      const finalImageUrl = fixUrlProtocol(imageUrl);
+      const finalMaskUrl = fixUrlProtocol(maskUrl);
 
       // 3. 初始化阿里云 RPC 客户端
       // 我们调用 ErasePerson (图像擦除/人体擦除) 接口，它支持传入 UserMask
@@ -65,8 +81,8 @@ export async function POST(req: Request) {
       });
 
       const params = {
-        "ImageURL": imageUrl,
-        "UserMask": maskUrl
+        "ImageURL": finalImageUrl,
+        "UserMask": finalMaskUrl
       };
 
       const requestOption = {
