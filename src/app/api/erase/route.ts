@@ -25,12 +25,46 @@ function base64ToTempFile(base64Str: string, prefix: string): string {
   return tempPath;
 }
 
+// 获取并修复 URL 协议，并确保它是可以通过阿里云内网验证的格式
+async function getSafeUrl(base64Data: string, prefix: string, accessKeyId: string, accessKeySecret: string): Promise<string> {
+  // 如果已经是之前处理过的阿里云链接，直接使用
+  if (base64Data.startsWith('http')) {
+    return base64Data;
+  }
+
+  // 1. 将前端传来的 base64 图片保存为服务器临时文件
+  const filePath = base64ToTempFile(base64Data, prefix);
+  
+  try {
+    // 2. 使用 viapi-utils 将文件上传到阿里云专门用于视觉智能 API 的上海临时 OSS 中
+    let uploadUrl = await viapiUtils.upload(accessKeyId, accessKeySecret, filePath);
+    
+    // 3. 强制修复在 Vercel 环境下常见的 undefined:// 协议头 Bug
+    if (uploadUrl.startsWith('undefined://')) {
+      uploadUrl = uploadUrl.replace('undefined://', 'http://');
+    }
+    
+    // 清理临时文件
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    
+    return uploadUrl;
+  } catch (error) {
+    // 清理临时文件
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    throw error;
+  }
+}
+
 export async function POST(req: Request) {
   try {
     const { image, mask } = await req.json();
 
     if (!image || !mask) {
-      return NextResponse.json({ error: 'Missing image or mask' }, { status: 400 });
+      return NextResponse.json({ error: '缺少图片或遮罩数据' }, { status: 400 });
     }
 
     const accessKeyId = process.env.ALIYUN_ACCESS_KEY_ID;
@@ -40,84 +74,51 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: '服务器未配置阿里云密钥' }, { status: 500 });
     }
 
-    // 1. 将 Base64 图片保存为临时文件 (如果是 http URL 则原样返回)
-    const imagePath = base64ToTempFile(image, 'image');
-    const maskPath = base64ToTempFile(mask, 'mask');
+    console.log("正在处理并上传图片到阿里云临时上海 OSS...");
+    
+    // 核心修复点：我们使用 viapi-utils 官方包进行上传。
+    // 因为这个包会将图片上传到专属于当前用户的“上海临时 OSS Bucket”中。
+    // 这完美符合阿里云 "非上海 OSS 图片链接非法" 的硬性要求。
+    const finalImageUrl = await getSafeUrl(image, 'image', accessKeyId, accessKeySecret);
+    const finalMaskUrl = await getSafeUrl(mask, 'mask', accessKeyId, accessKeySecret);
 
-    try {
-      // 2. 获取最终需要发给阿里云的 URL
-      // 如果 imagePath 是以 http 开头的，说明它是二次编辑传过来的线上地址，直接用，不需要再上传到 OSS
-      // 注意：在 Vercel 这种 Serverless 环境中，viapiUtils 可能会因为依赖缺失或网络超时导致失败
-      // 为了稳定，我们直接使用阿里云 SDK 的 OSS 直传或者修复 viapiUtils 的超时问题
-      // 但最快的方式是给 viapiUtils.upload 增加重试机制，或者忽略其内部的超时警告
-      const imageUrl = imagePath.startsWith('http') 
-        ? imagePath 
-        : await viapiUtils.upload(accessKeyId, accessKeySecret, imagePath);
-        
-      const maskUrl = maskPath.startsWith('http')
-        ? maskPath
-        : await viapiUtils.upload(accessKeyId, accessKeySecret, maskPath);
+    console.log("上传成功，准备调用 ErasePerson API...");
+    console.log("ImageURL:", finalImageUrl);
+    console.log("UserMask:", finalMaskUrl);
 
-      // 由于 viapiUtils.upload 内部实现有些老旧，在 Vercel 线上环境可能会返回缺少 http/https 协议头的 URL
-      // 例如： undefined://viapi-customer-temp.oss-cn-shanghai... 
-      // 我们在这里强制修复这个 URL 协议头
-      const fixUrlProtocol = (url: string) => {
-        if (url.startsWith('undefined://')) {
-          return url.replace('undefined://', 'http://');
-        }
-        return url;
-      };
+    // 初始化阿里云 RPC 客户端
+    const client = new Core({
+      accessKeyId: accessKeyId,
+      accessKeySecret: accessKeySecret,
+      endpoint: 'https://imageenhan.cn-shanghai.aliyuncs.com',
+      apiVersion: '2019-09-30',
+    });
 
-      const finalImageUrl = fixUrlProtocol(imageUrl);
-      const finalMaskUrl = fixUrlProtocol(maskUrl);
+    const params = {
+      "ImageURL": finalImageUrl,
+      "UserMask": finalMaskUrl
+    };
 
-      // 3. 初始化阿里云 RPC 客户端
-      // 我们调用 ErasePerson (图像擦除/人体擦除) 接口，它支持传入 UserMask
-      const client = new Core({
-        accessKeyId: accessKeyId,
-        accessKeySecret: accessKeySecret,
-        endpoint: 'https://imageenhan.cn-shanghai.aliyuncs.com',
-        apiVersion: '2019-09-30',
-      });
+    // 关键：为了解决部分大图导致的 ReadTimeout 报错，我们将超时时间提升到 30 秒！
+    const requestOption = {
+      method: 'POST' as const,
+      formatParams: false,
+      timeout: 30000 // 增加到 30 秒
+    };
 
-      const params = {
-        "ImageURL": finalImageUrl,
-        "UserMask": finalMaskUrl
-      };
+    // 发送请求给阿里云
+    const result: any = await client.request('ErasePerson', params, requestOption);
+    console.log("阿里云 API 返回结果:", JSON.stringify(result, null, 2));
 
-      const requestOption = {
-        method: 'POST',
-        formatParams: false,
-      };
-
-      // 4. 发送请求给阿里云
-      console.log("正在调用阿里云 ErasePerson API...");
-      console.log("ImageURL:", imageUrl);
-      console.log("UserMask:", maskUrl);
-      
-      const result: any = await client.request('ErasePerson', params, requestOption);
-      console.log("阿里云 API 返回结果:", JSON.stringify(result, null, 2));
-
-      // 清理临时文件 (只有当它是本地临时文件路径时才清理)
-      if (!imagePath.startsWith('http') && fs.existsSync(imagePath)) fs.unlinkSync(imagePath);
-      if (!maskPath.startsWith('http') && fs.existsSync(maskPath)) fs.unlinkSync(maskPath);
-
-      if (result && result.Data && result.Data.ImageUrl) {
-        return NextResponse.json({ resultUrl: result.Data.ImageUrl });
-      } else {
-        return NextResponse.json({ error: '处理失败，未返回图片地址', rawResponse: result }, { status: 500 });
-      }
-
-    } catch (apiError: any) {
-      // 清理临时文件
-      if (fs.existsSync(imagePath)) fs.unlinkSync(imagePath);
-      if (fs.existsSync(maskPath)) fs.unlinkSync(maskPath);
-      console.error("Aliyun API Error:", apiError);
-      return NextResponse.json({ error: apiError.message || '调用阿里云接口失败' }, { status: 500 });
+    if (result && result.Data && result.Data.ImageUrl) {
+      return NextResponse.json({ url: result.Data.ImageUrl });
+    } else {
+      return NextResponse.json({ error: '处理失败，未返回图片地址', rawResponse: result }, { status: 500 });
     }
 
   } catch (error: any) {
-    console.error("Server Error:", error);
-    return NextResponse.json({ error: error.message || '内部服务器错误' }, { status: 500 });
+    console.error("处理过程中报错:", error);
+    const errorMsg = error.data ? JSON.stringify(error.data) : error.message;
+    return NextResponse.json({ error: errorMsg || '内部服务器错误' }, { status: 500 });
   }
 }
