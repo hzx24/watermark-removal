@@ -50,26 +50,21 @@ export async function POST(req: Request) {
       // 注意：在 Vercel 这种 Serverless 环境中，viapiUtils 可能会因为依赖缺失或网络超时导致失败
       // 为了稳定，我们直接使用阿里云 SDK 的 OSS 直传或者修复 viapiUtils 的超时问题
       // 但最快的方式是给 viapiUtils.upload 增加重试机制，或者忽略其内部的超时警告
-      const imageUrl = imagePath.startsWith('http') 
+      let imageUrl = imagePath.startsWith('http') 
         ? imagePath 
         : await viapiUtils.upload(accessKeyId, accessKeySecret, imagePath);
         
-      const maskUrl = maskPath.startsWith('http')
+      let maskUrl = maskPath.startsWith('http')
         ? maskPath
         : await viapiUtils.upload(accessKeyId, accessKeySecret, maskPath);
 
-      // 由于 viapiUtils.upload 内部实现有些老旧，在 Vercel 线上环境可能会返回缺少 http/https 协议头的 URL
-      // 例如： undefined://viapi-customer-temp.oss-cn-shanghai... 
-      // 我们在这里强制修复这个 URL 协议头
-      const fixUrlProtocol = (url: string) => {
-        if (url.startsWith('undefined://')) {
-          return url.replace('undefined://', 'http://');
-        }
-        return url;
-      };
-
-      const finalImageUrl = fixUrlProtocol(imageUrl);
-      const finalMaskUrl = fixUrlProtocol(maskUrl);
+      // 强制修复在 Vercel 线上环境下，viapi-utils 生成的协议头变为 undefined:// 的 bug
+      if (imageUrl.startsWith('undefined://')) {
+        imageUrl = imageUrl.replace('undefined://', 'http://');
+      }
+      if (maskUrl.startsWith('undefined://')) {
+        maskUrl = maskUrl.replace('undefined://', 'http://');
+      }
 
       // 3. 初始化阿里云 RPC 客户端
       // 我们调用 ErasePerson (图像擦除/人体擦除) 接口，它支持传入 UserMask
@@ -81,13 +76,14 @@ export async function POST(req: Request) {
       });
 
       const params = {
-        "ImageURL": finalImageUrl,
-        "UserMask": finalMaskUrl
+        "ImageURL": imageUrl,
+        "UserMask": maskUrl
       };
 
       const requestOption = {
-        method: 'POST',
+        method: 'POST' as const,
         formatParams: false,
+        timeout: 30000 // 【非常重要】增加超时时间为 30 秒，防止手机端网速慢时报错
       };
 
       // 4. 发送请求给阿里云
