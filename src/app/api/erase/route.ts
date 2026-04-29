@@ -1,90 +1,28 @@
 import { NextResponse } from 'next/server';
-// 我们直接使用原生代码和 fetch，彻底放弃阿里云官方的老旧 SDK！
-import crypto from 'crypto';
+// @ts-ignore
+import Core from '@alicloud/pop-core';
+// @ts-ignore
+import viapiUtils from '@alicloud/viapi-utils';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 
-// ---------------------------------------------------------
-// 1. 核心工具：向阿里云申请 STS 临时上传凭证
-// ---------------------------------------------------------
-async function getStsToken(accessKeyId: string, accessKeySecret: string) {
-  const method = 'POST';
-  const endpoint = 'https://sts.cn-shanghai.aliyuncs.com/';
-
-  const params: Record<string, string> = {
-    Format: 'JSON',
-    Version: '2015-04-01',
-    AccessKeyId: accessKeyId,
-    SignatureMethod: 'HMAC-SHA1',
-    Timestamp: new Date().toISOString().replace(/\.\d{3}/, ''),
-    SignatureVersion: '1.0',
-    SignatureNonce: crypto.randomUUID(),
-    Action: 'GetSessionAccessKey', // 使用视觉智能专用的 Action
-    DurationSeconds: '3600'
-  };
-
-  const keys = Object.keys(params).sort();
-  const canonicalizedQueryString = keys.map(key => `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`).join('&');
-  const stringToSign = `${method}&%2F&${encodeURIComponent(canonicalizedQueryString)}`;
-  const signature = crypto.createHmac('sha1', `${accessKeySecret}&`).update(stringToSign).digest('base64');
-  
-  params.Signature = signature;
-
-  const res = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams(params).toString(),
-  });
-
-  const data = await res.json();
-  if (!data.SessionAccessKey || !data.SessionAccessKey.SessionAccessKeyId) {
-    // 如果 GetSessionAccessKey 失败，说明该账号不支持临时凭证直传，
-    // 我们将使用备用方案：直接把 Base64 发给阿里云的底层 API！
-    return null;
+// 将 Base64 转换为临时文件
+function base64ToTempFile(base64Str: string, prefix: string): string {
+  // 检查是否已经是 http 链接（二次编辑时可能会传过来阿里云的 URL）
+  if (base64Str.startsWith('http://') || base64Str.startsWith('https://')) {
+    return base64Str; // 如果已经是 URL，就不处理，直接返回
   }
-  return data;
-}
 
-// ---------------------------------------------------------
-// 2. 核心工具：直接调用图像擦除底层 API (原生 Fetch 版，永不超时)
-// ---------------------------------------------------------
-async function callAliyunErasePerson(imageBase64: string, maskBase64: string, accessKeyId: string, accessKeySecret: string) {
-  const endpoint = 'https://imageenhan.cn-shanghai.aliyuncs.com/';
-  
-  const params: Record<string, string> = {
-    Format: 'JSON',
-    Version: '2019-09-30',
-    AccessKeyId: accessKeyId,
-    SignatureMethod: 'HMAC-SHA1',
-    Timestamp: new Date().toISOString().replace(/\.\d{3}/, ''),
-    SignatureVersion: '1.0',
-    SignatureNonce: crypto.randomUUID(),
-    Action: 'ErasePerson',
-    ImageURL: imageBase64, // 阿里云其实支持直接传 Base64 字符串
-    UserMask: maskBase64
-  };
-
-  const keys = Object.keys(params).sort();
-  
-  // 必须使用阿里云特定的 encode 规则
-  const percentEncode = (str: string) => encodeURIComponent(str).replace(/\!/g, '%21').replace(/\'/g, '%27').replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/\*/g, '%2A');
-  
-  const canonicalizedQueryString = keys.map(key => `${percentEncode(key)}=${percentEncode(params[key])}`).join('&');
-  const stringToSign = `POST&%2F&${percentEncode(canonicalizedQueryString)}`;
-  const signature = crypto.createHmac('sha1', `${accessKeySecret}&`).update(stringToSign).digest('base64');
-  
-  params.Signature = signature;
-
-  // 使用 Vercel 原生的 fetch，它不会像 pop-core 那样动不动就 3000ms 超时死锁
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams(params).toString(),
-  });
-
-  const result = await response.json();
-  if (!response.ok) {
-    throw new Error(result.Message || JSON.stringify(result));
+  const matches = base64Str.match(/^data:image\/([A-Za-z-+\/]+);base64,(.+)$/);
+  if (!matches || matches.length !== 3) {
+    throw new Error('Invalid base64 string');
   }
-  return result;
+  const ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
+  const buffer = Buffer.from(matches[2], 'base64');
+  const tempPath = path.join(os.tmpdir(), `${prefix}-${Date.now()}.${ext}`);
+  fs.writeFileSync(tempPath, buffer);
+  return tempPath;
 }
 
 export async function POST(req: Request) {
@@ -92,7 +30,7 @@ export async function POST(req: Request) {
     const { image, mask } = await req.json();
 
     if (!image || !mask) {
-      return NextResponse.json({ error: '缺少图片或遮罩数据' }, { status: 400 });
+      return NextResponse.json({ error: 'Missing image or mask' }, { status: 400 });
     }
 
     const accessKeyId = process.env.ALIYUN_ACCESS_KEY_ID;
@@ -102,36 +40,84 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: '服务器未配置阿里云密钥' }, { status: 500 });
     }
 
-    console.log("正在处理图片 (纯净 Vercel Serverless 版)...");
+    // 1. 将 Base64 图片保存为临时文件 (如果是 http URL 则原样返回)
+    const imagePath = base64ToTempFile(image, 'image');
+    const maskPath = base64ToTempFile(mask, 'mask');
 
-    // 提取干净的 Base64 字符串
-    const extractBase64 = async (dataUrl: string) => {
-      if (dataUrl.startsWith('http')) {
-         const res = await fetch(dataUrl);
-         const buffer = await res.arrayBuffer();
-         return Buffer.from(buffer).toString('base64');
+    try {
+      // 2. 获取最终需要发给阿里云的 URL
+      // 如果 imagePath 是以 http 开头的，说明它是二次编辑传过来的线上地址，直接用，不需要再上传到 OSS
+      // 注意：在 Vercel 这种 Serverless 环境中，viapiUtils 可能会因为依赖缺失或网络超时导致失败
+      // 为了稳定，我们直接使用阿里云 SDK 的 OSS 直传或者修复 viapiUtils 的超时问题
+      // 但最快的方式是给 viapiUtils.upload 增加重试机制，或者忽略其内部的超时警告
+      const imageUrl = imagePath.startsWith('http') 
+        ? imagePath 
+        : await viapiUtils.upload(accessKeyId, accessKeySecret, imagePath);
+        
+      const maskUrl = maskPath.startsWith('http')
+        ? maskPath
+        : await viapiUtils.upload(accessKeyId, accessKeySecret, maskPath);
+
+      // 由于 viapiUtils.upload 内部实现有些老旧，在 Vercel 线上环境可能会返回缺少 http/https 协议头的 URL
+      // 例如： undefined://viapi-customer-temp.oss-cn-shanghai... 
+      // 我们在这里强制修复这个 URL 协议头
+      const fixUrlProtocol = (url: string) => {
+        if (url.startsWith('undefined://')) {
+          return url.replace('undefined://', 'http://');
+        }
+        return url;
+      };
+
+      const finalImageUrl = fixUrlProtocol(imageUrl);
+      const finalMaskUrl = fixUrlProtocol(maskUrl);
+
+      // 3. 初始化阿里云 RPC 客户端
+      // 我们调用 ErasePerson (图像擦除/人体擦除) 接口，它支持传入 UserMask
+      const client = new Core({
+        accessKeyId: accessKeyId,
+        accessKeySecret: accessKeySecret,
+        endpoint: 'https://imageenhan.cn-shanghai.aliyuncs.com',
+        apiVersion: '2019-09-30',
+      });
+
+      const params = {
+        "ImageURL": finalImageUrl,
+        "UserMask": finalMaskUrl
+      };
+
+      const requestOption = {
+        method: 'POST',
+        formatParams: false,
+      };
+
+      // 4. 发送请求给阿里云
+      console.log("正在调用阿里云 ErasePerson API...");
+      console.log("ImageURL:", imageUrl);
+      console.log("UserMask:", maskUrl);
+      
+      const result: any = await client.request('ErasePerson', params, requestOption);
+      console.log("阿里云 API 返回结果:", JSON.stringify(result, null, 2));
+
+      // 清理临时文件 (只有当它是本地临时文件路径时才清理)
+      if (!imagePath.startsWith('http') && fs.existsSync(imagePath)) fs.unlinkSync(imagePath);
+      if (!maskPath.startsWith('http') && fs.existsSync(maskPath)) fs.unlinkSync(maskPath);
+
+      if (result && result.Data && result.Data.ImageUrl) {
+        return NextResponse.json({ resultUrl: result.Data.ImageUrl });
+      } else {
+        return NextResponse.json({ error: '处理失败，未返回图片地址', rawResponse: result }, { status: 500 });
       }
-      return dataUrl.replace(/^data:image\/\w+;base64,/, "");
-    };
 
-    const imageBase64 = await extractBase64(image);
-    const maskBase64 = await extractBase64(mask);
-
-    console.log("图片已转换为 Base64，准备直接调用 ErasePerson API...");
-
-    // 直接使用纯净的 fetch 调用阿里云底层 API，彻底绕过所有第三方包的超时和协议 Bug
-    const result = await callAliyunErasePerson(imageBase64, maskBase64, accessKeyId, accessKeySecret);
-    
-    console.log("阿里云 API 返回成功");
-
-    if (result && result.Data && result.Data.ImageUrl) {
-      return NextResponse.json({ url: result.Data.ImageUrl });
-    } else {
-      return NextResponse.json({ error: '处理失败，未返回图片地址', rawResponse: result }, { status: 500 });
+    } catch (apiError: any) {
+      // 清理临时文件
+      if (fs.existsSync(imagePath)) fs.unlinkSync(imagePath);
+      if (fs.existsSync(maskPath)) fs.unlinkSync(maskPath);
+      console.error("Aliyun API Error:", apiError);
+      return NextResponse.json({ error: apiError.message || '调用阿里云接口失败' }, { status: 500 });
     }
 
   } catch (error: any) {
-    console.error("处理过程中报错:", error);
+    console.error("Server Error:", error);
     return NextResponse.json({ error: error.message || '内部服务器错误' }, { status: 500 });
   }
 }
