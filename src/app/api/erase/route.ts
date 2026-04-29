@@ -1,11 +1,18 @@
 import { NextResponse } from 'next/server';
 // @ts-ignore
 import Core from '@alicloud/pop-core';
-// @ts-ignore
-import viapiUtils from '@alicloud/viapi-utils';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+// 引入阿里云临时上传所需的底层依赖
+// @ts-ignore
+import * as RPCClient from '@alicloud/rpc-client';
+// @ts-ignore
+import viapiutils20200401, { GetOssStsTokenRequest } from '@alicloud/viapiutils20200401';
+// @ts-ignore
+import * as OSSClient from '@alicloud/oss-client';
+// @ts-ignore
+import { RuntimeOptions } from '@alicloud/oss-util';
 
 // 将 Base64 转换为临时文件
 function base64ToTempFile(base64Str: string, prefix: string): string {
@@ -23,6 +30,57 @@ function base64ToTempFile(base64Str: string, prefix: string): string {
   const tempPath = path.join(os.tmpdir(), `${prefix}-${Date.now()}.${ext}`);
   fs.writeFileSync(tempPath, buffer);
   return tempPath;
+}
+
+// 自定义上传函数，解决 Vercel 下 viapi-utils 的 3000ms 超时和 undefined:// 协议头 Bug
+async function uploadToAliyunTemp(accessKeyId: string, accessKeySecret: string, filePath: string): Promise<string> {
+  // 1. 获取 STS Token
+  const viConfig = new RPCClient.Config({
+    accessKeyId,
+    accessKeySecret,
+    type: "access_key",
+    endpoint: "viapiutils.cn-shanghai.aliyuncs.com",
+    regionId: "cn-shanghai",
+  });
+  const viclient = new viapiutils20200401(viConfig);
+  const viRequest = new GetOssStsTokenRequest({});
+  const viResponse = await viclient.getOssStsToken(viRequest);
+
+  if (!viResponse || !viResponse.data) {
+    throw new Error("Failed to get STS token from Aliyun");
+  }
+
+  // 2. 构造 OSS 客户端
+  const ossConfig = new OSSClient.Config({
+    accessKeyId: viResponse.data.accessKeyId,
+    accessKeySecret: viResponse.data.accessKeySecret,
+    securityToken: viResponse.data.securityToken,
+    type: "sts",
+    endpoint: "oss-cn-shanghai.aliyuncs.com",
+    regionId: "cn-shanghai",
+  });
+  const ossClient = new OSSClient.default(ossConfig);
+
+  // 3. 准备上传
+  const fileName = path.basename(filePath);
+  const objectName = `${accessKeyId}/${Date.now()}-${Math.floor(Math.random()*10000)}-${fileName}`;
+  const ins = fs.createReadStream(filePath);
+  
+  const uploadRequest = new OSSClient.PutObjectRequest({
+    bucketName: "viapi-customer-temp",
+    body: ins,
+    objectName: objectName,
+  });
+
+  // 这里的核心：覆盖默认的 3000ms 超时限制！Vercel 免费版函数上限通常是 10s，我们给 30s 宽限
+  const ossRuntime = new RuntimeOptions({
+    readTimeout: 30000,
+    connectTimeout: 30000,
+  });
+
+  await ossClient.putObject(uploadRequest, ossRuntime);
+  
+  return `http://viapi-customer-temp.oss-cn-shanghai.aliyuncs.com/${objectName}`;
 }
 
 export async function POST(req: Request) {
@@ -47,16 +105,14 @@ export async function POST(req: Request) {
     try {
       // 2. 获取最终需要发给阿里云的 URL
       // 如果 imagePath 是以 http 开头的，说明它是二次编辑传过来的线上地址，直接用，不需要再上传到 OSS
-      // 注意：在 Vercel 这种 Serverless 环境中，viapiUtils 可能会因为依赖缺失或网络超时导致失败
-      // 为了稳定，我们直接使用阿里云 SDK 的 OSS 直传或者修复 viapiUtils 的超时问题
-      // 但最快的方式是给 viapiUtils.upload 增加重试机制，或者忽略其内部的超时警告
+      // 注意：在 Vercel 这种 Serverless 环境中，由于网络环境差异导致上传容易超时，我们改用自定义的上传逻辑
       const imageUrl = imagePath.startsWith('http') 
         ? imagePath 
-        : await viapiUtils.upload(accessKeyId, accessKeySecret, imagePath);
+        : await uploadToAliyunTemp(accessKeyId, accessKeySecret, imagePath);
         
       const maskUrl = maskPath.startsWith('http')
         ? maskPath
-        : await viapiUtils.upload(accessKeyId, accessKeySecret, maskPath);
+        : await uploadToAliyunTemp(accessKeyId, accessKeySecret, maskPath);
 
       // 由于 viapiUtils.upload 内部实现有些老旧，在 Vercel 线上环境可能会返回缺少 http/https 协议头的 URL
       // 例如： undefined://viapi-customer-temp.oss-cn-shanghai... 
